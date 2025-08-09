@@ -1,11 +1,14 @@
 """
-🎯 Bing Rewards 自动化脚本 - 多账号支持版-v1.0
+🎯 Bing Rewards 自动化脚本 - 多账号支持版-v1.1
 变量名：bing_ck  多账号换行 
+下面url抓取CK
+https://rewards.bing.com/?ssp=1&safesearch=moderate&setlang=zh-hans&cc=CN&ensearch=0&PC=SANSAAND
 如果执行的发现积分不增长，且脚本上显示的积分跟实际不符，很有可能不是同一个账号的cookie，建议重新抓取。
 From:yaohuo28507
 
-cron: 10 0-20 * * *
+cron: 10 0-22 * * *
 """
+
 import requests
 import random
 import re
@@ -13,7 +16,7 @@ import time
 import json
 import os
 from datetime import datetime, date
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 import threading
 
 # 尝试导入notify，失败则使用本地打印替代
@@ -196,7 +199,7 @@ def get_rewards_points(cookies, account_index=None):
             
         if email_match:
             email = email_match.group(1)
-            # print_log("账号信息", f"账号: {email}")
+            # print_log("账号信息", f"\n账号: {email}")
         else:
             print_log("账号信息", "未找到 email 值", account_index)
             
@@ -213,19 +216,17 @@ def get_rewards_points(cookies, account_index=None):
         return None
 
 def bing_search_pc(cookies, account_index=None, email=None):
-    # 使用热搜词
     q = get_next_hot_word(account_index, email)
-    #print_log("搜索关键词", f"本次搜索词: {q}", account_index)
-
-    url = "https://cn.bing.com/search"
+    search_url = "https://cn.bing.com/search"
     params = {
         "q": q,
-        "qs": "FT",
+        "qs": "HS",       # 根据抓包信息从 "FT" 修改为 "HS"
         "form": "TSASDS"
     }
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36 Edg/137.0.0.0",
+    get_headers = {
+        # 使用抓包信息中较新的User-Agent
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36 Edg/138.0.0.0",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
         "Referer": "https://rewards.bing.com/",
         "Accept-Language": "zh-CN,zh;q=0.9",
@@ -233,72 +234,88 @@ def bing_search_pc(cookies, account_index=None, email=None):
     }
 
     try:
-        response = requests.get(url, params=params, headers=headers)
-        if response.status_code == 200:
+        req = requests.Request('GET', search_url, params=params, headers=get_headers)
+        prepared_req = req.prepare()
+        full_search_url = prepared_req.url
+
+        search_response = requests.get(search_url, params=params, headers=get_headers, timeout=10)
+        search_response.raise_for_status()
+        
+        html_content = search_response.text
+        ig_match = re.search(r'IG:"([^"]+)"', html_content)
+        iid_match = re.search(r'data_iid\s*=\s*"([^"]+)"', html_content)
+
+        if not ig_match or not iid_match:
+            print_log("电脑搜索", "无法从页面提取 IG 或 IID，跳过报告活动", account_index)
+            return False 
+
+        ig_value = ig_match.group(1)
+        iid_value = iid_match.group(1)
+
+        time.sleep(random.uniform(2, 5))
+
+        report_url = (f"https://cn.bing.com/rewardsapp/reportActivity?IG={ig_value}&IID={iid_value}"
+                      f"&q={quote(q)}&qs=HS&form=TSASDS&ajaxreq=1")
+
+        post_headers = {
+            "User-Agent": get_headers["User-Agent"],
+            "Accept": "*/*",
+            "Origin": "https://cn.bing.com",
+            "Referer": full_search_url,  
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Cookie": cookies
+        }
+        
+        post_data = f"url={quote(full_search_url, safe='')}&V=web"
+
+        report_response = requests.post(report_url, headers=post_headers, data=post_data, timeout=10)
+
+        if 200 <= report_response.status_code < 400:
             return True
         else:
+            print_log("电脑搜索", f"步骤2 (POST) 失败, 状态码: {report_response.status_code}", account_index)
             return False
+
+    except requests.exceptions.RequestException as e:
+        print_log("电脑搜索", f"电脑搜索网络异常: {e}", account_index)
+        return False
     except Exception as e:
-        print_log("电脑搜索", f"电脑搜索异常: {e}", account_index)
+        print_log("电脑搜索", f"电脑搜索发生未知错误: {e}", account_index)
         return False
 
 def bing_search_mobile(cookies, account_index=None, email=None):
-    """执行移动设备搜索，使用热搜词"""
     q = get_next_hot_word(account_index, email)
-    #print_log("搜索关键词", f"本次搜索词: {q}", account_index)
 
-    # 模拟真实移动搜索请求的cookie
     enhanced_cookies = cookies
-    
-    # 移除桌面版特有的cookie字段，这些可能影响移动搜索识别
-    import re
-    
-    # 移除桌面版特有的字段
     desktop_fields_to_remove = [
-        r'_HPVN=[^;]+',
-        r'_RwBf=[^;]+', 
-        r'_U=[^;]+',
-        r'USRLOC=[^;]+',
-        r'BFBUSR=[^;]+',
-        r'_Rwho=[^;]+',
-        r'ipv6=[^;]+',
-        r'_clck=[^;]+',
-        r'_clsk=[^;]+',
-        r'webisession=[^;]+',
-        r'MicrosoftApplicationsTelemetryDeviceId=[^;]+',
-        r'MicrosoftApplicationsTelemetryFirstLaunchTime=[^;]+',
-        r'MSPTC=[^;]+',
-        r'vdp=[^;]+'
+        r'_HPVN=[^;]+', r'_RwBf=[^;]+', r'_U=[^;]+', r'USRLOC=[^;]+',
+        r'BFBUSR=[^;]+', r'_Rwho=[^;]+', r'ipv6=[^;]+', r'_clck=[^;]+',
+        r'_clsk=[^;]+', r'webisession=[^;]+', r'MicrosoftApplicationsTelemetryDeviceId=[^;]+',
+        r'MicrosoftApplicationsTelemetryFirstLaunchTime=[^;]+', r'MSPTC=[^;]+', r'vdp=[^;]+'
     ]
-    
     for pattern in desktop_fields_to_remove:
         enhanced_cookies = re.sub(pattern, '', enhanced_cookies)
     
-    # 清理多余的分号和空格
-    enhanced_cookies = re.sub(r';;+', ';', enhanced_cookies)
-    enhanced_cookies = enhanced_cookies.strip('; ')
+    enhanced_cookies = re.sub(r';;+', ';', enhanced_cookies).strip('; ')
     
-    # 替换SRCHUSR为简化版本（移除DS和POEX参数）
     if 'SRCHUSR=' in enhanced_cookies:
         enhanced_cookies = re.sub(r'SRCHUSR=[^;]+', 'SRCHUSR=DOB=20250706', enhanced_cookies)
     else:
         enhanced_cookies += '; SRCHUSR=DOB=20250706'
-    
-    # 确保有SRCHD字段
+        
     if 'SRCHD=' not in enhanced_cookies:
         enhanced_cookies += '; SRCHD=AF=NOFORM'
-    
-    # 添加或替换SRCHHPGUSR为移动设备版本
+        
     if 'SRCHHPGUSR=' in enhanced_cookies:
         enhanced_cookies = re.sub(r'SRCHHPGUSR=[^;]+', 'SRCHHPGUSR=SRCHLANG=zh-Hans&DM=0&CW=360&CH=493&SCW=360&SCH=493&BRW=MM&BRH=MS&DPR=3.0&UTC=480&PR=3&OR=0&PRVCW=360&PRVCH=493&HV=1751764054&HVE=CfDJ8Inh5QCoSQBNls38F2rbEpSFNIuT7R7A-dN544maOpoSyIiAlvCb43wPmzrMB8xLZeNzPTVPZYSpNz07pdIhrHpXIpf7BsQSxPNmP9esnrCjcj4OTSnzlqIQ0NroSiLt3Awrdp6qCqmkbZUfleTej6Bio11sryZznjdagVAUt5JoBZSzj5SbjYNHGoSgrIu2Ow&PREFCOL=0', enhanced_cookies)
     else:
         enhanced_cookies += '; SRCHHPGUSR=SRCHLANG=zh-Hans&DM=0&CW=360&CH=493&SCW=360&SCH=493&BRW=MM&BRH=MS&DPR=3.0&UTC=480&PR=3&OR=0&PRVCW=360&PRVCH=493&HV=1751764054&HVE=CfDJ8Inh5QCoSQBNls38F2rbEpSFNIuT7R7A-dN544maOpoSyIiAlvCb43wPmzrMB8xLZeNzPTVPZYSpNz07pdIhrHpXIpf7BsQSxPNmP9esnrCjcj4OTSnzlqIQ0NroSiLt3Awrdp6qCqmkbZUfleTej6Bio11sryZznjdagVAUt5JoBZSzj5SbjYNHGoSgrIu2Ow&PREFCOL=0'
 
-    url = "https://cn.bing.com/search"
+    search_url = "https://cn.bing.com/search"
     params = {
         "q": q,
         "form": "NPII01",
-        "filters": "tnTID:\"DSBOS_F29F59C848FA467D96D2F8EEC96FBC7A\" tnVersion:\"8908b7744161474e8812c12c507ece49\" Segment:\"popularnow.carousel\" tnCol:\"39\" tnScenario:\"TrendingTopicsAPI\" tnOrder:\"ef45722b-8213-4953-9c44-57e0dde6ac78\"",
+        "filters": 'tnTID:"DSBOS_FF440E8FE53E4F718C505BF9E0B69D08" tnVersion:"d1d6d5bcada64df7a0182f7bc3516b45" Segment:"popularnow.carousel" tnCol:"3" tnScenario:"TrendingTopicsAPI" tnOrder:"4a2117a4-4237-4b9e-85d0-67fef7b5f2be"',
         "ssp": "1",
         "safesearch": "moderate",
         "setlang": "zh-hans",
@@ -306,8 +323,7 @@ def bing_search_mobile(cookies, account_index=None, email=None):
         "ensearch": "0",
         "PC": "SANSAAND"
     }
-
-    headers = {
+    get_headers = {
         "host": "cn.bing.com",
         "upgrade-insecure-requests": "1",
         "user-agent": "Mozilla/5.0 (Linux; Android 9; OPPO R11 Plus Build/PKQ1.190414.001; ) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/74.0.3729.136 Mobile Safari/537.36 BingSapphire/31.4.2110003555",
@@ -317,25 +333,53 @@ def bing_search_mobile(cookies, account_index=None, email=None):
         "sapphire-configuration": "Production",
         "sapphire-apiversion": "114",
         "sapphire-market": "zh-CN",
-        "x-search-clientid": "2E2936301F8D6BFD3225203D1E5F6A0D",
+        "x-search-clientid": "03581D35CCED6C3913AB0B14CD8B6D94",
         "sapphire-devicetype": "OPPO R11 Plus",
         "accept-encoding": "gzip, deflate",
         "accept-language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-        "cookie": enhanced_cookies,
+        "cookie": enhanced_cookies, 
         "x-requested-with": "com.microsoft.bing"
     }
-
+    
     try:
-        response = requests.get(url, headers=headers, params=params)
-        if response.status_code == 200:
+        req = requests.Request('GET', search_url, headers=get_headers, params=params)
+        prepared_req = req.prepare()
+        full_search_url = prepared_req.url
+
+        search_response = requests.get(search_url, headers=get_headers, params=params, timeout=10)
+
+        if search_response.status_code != 200:
+            print_log("移动搜索", f"步骤1 (GET) 失败, 状态码: {search_response.status_code}", account_index)
+            return False
+
+        time.sleep(random.uniform(2, 5))
+
+        report_url = "https://www.bing.com/rewardsapp/reportActivity"
+        post_data_str = f"url={quote(full_search_url, safe='')}&V=web"
+        
+        post_headers = {
+            "host": "www.bing.com",
+            "user-agent": get_headers["user-agent"],
+            "accept": "*/*",
+            "content-type": "application/x-www-form-urlencoded; charset=utf-8",
+            "referer": "https://cn.bing.com/",
+            "cookie": enhanced_cookies 
+        }
+
+        report_response = requests.post(report_url, headers=post_headers, data=post_data_str, timeout=10)
+        
+        if 200 <= report_response.status_code < 400:
             return True
         else:
+            print_log("移动搜索", f"步骤2 (POST) 失败, 状态码: {report_response.status_code}", account_index)
             return False
-    except Exception as e:
-        print_log("移动搜索", f"移动设备搜索异常: {e}", account_index)
+
+    except requests.exceptions.RequestException as e:
+        print_log("移动搜索", f"移动设备搜索网络异常: {e}", account_index)
         return False
-
-
+    except Exception as e:
+        print_log("移动搜索", f"移动设备搜索发生未知错误: {e}", account_index)
+        return False
 
 def get_dashboard_data(cookies, account_index=None):
     """统一获取dashboard数据和token"""
@@ -389,7 +433,7 @@ def complete_daily_set_tasks(cookies, account_index=None):
             user_status = dashboard_data['userStatus']
             available_points = user_status.get('availablePoints', 0)
             lifetime_points = user_status.get('lifetimePoints', 0)
-            # print_log("每日活动", f"? 当前积分: {available_points}, 总积分: {lifetime_points}", account_index)
+            # print_log("每日活动", f"✅ 当前积分: {available_points}, 总积分: {lifetime_points}", account_index)
         
         # 提取每日任务
         today_str = date.today().strftime('%m/%d/%Y')
@@ -414,9 +458,9 @@ def complete_daily_set_tasks(cookies, account_index=None):
             
             if execute_task(task, token, cookies, account_index):
                 completed_count += 1
-                print_log("每日活动", f"? 任务完成: {task.get('title', '未知任务')}", account_index)
+                print_log("每日活动", f"✅ 任务完成: {task.get('title', '未知任务')}", account_index)
             else:
-                print_log("每日活动", f"? 任务失败: {task.get('title', '未知任务')}", account_index)
+                print_log("每日活动", f"❌ 任务失败: {task.get('title', '未知任务')}", account_index)
             
             # 随机延迟
             time.sleep(random.uniform(2, 4))
@@ -524,7 +568,7 @@ def report_activity(task, token, cookies, account_index=None):
             try:
                 result = response.json()
                 if result.get("activity") and result["activity"].get("points", 0) > 0:
-                    print_log("更多活动", f"? 获得{result['activity']['points']}积分", account_index)
+                    print_log("更多活动", f"✅ 获得{result['activity']['points']}积分", account_index)
                     return True
                 else:
                     return False
@@ -540,7 +584,7 @@ def execute_task(task, token, cookies, account_index=None):
     try:
         destination_url = task.get('destinationUrl') or task.get('attributes', {}).get('destination')
         if not destination_url:
-            print_log("更多活动", f"? 任务 {task.get('name')} 没有目标URL", account_index)
+            print_log("更多活动", f"❌ 任务 {task.get('name')} 没有目标URL", account_index)
             return False
         
         # 检查是否为搜索任务
@@ -548,10 +592,10 @@ def execute_task(task, token, cookies, account_index=None):
         
         if search_query:
             # 搜索任务
-            print_log("更多活动", f"? 执行搜索任务: {task.get('title')}", account_index)
+            print_log("更多活动", f"🔍 执行搜索任务: {task.get('title')}", account_index)
         else:
             # 非搜索任务（如Edge相关任务）
-            print_log("更多活动", f"? 执行URL访问任务: {task.get('title')}", account_index)
+            print_log("更多活动", f"🌐 执行URL访问任务: {task.get('title')}", account_index)
             
             # 对于Edge相关任务，可能需要特殊处理URL
             if 'microsoftedgewelcome.microsoft.com' in destination_url:
@@ -573,19 +617,19 @@ def execute_task(task, token, cookies, account_index=None):
         )
         
         if response.status_code == 200:
-            print_log("更多活动", f"? 任务执行成功", account_index)
+            print_log("更多活动", f"✅ 任务执行成功", account_index)
             # 报告活动
             if report_activity(task, token, cookies, account_index):
                 return True
             else:
-                print_log("更多活动", f"?? 任务执行成功但活动报告失败", account_index)
+                print_log("更多活动", f"⚠️ 任务执行成功但活动报告失败", account_index)
                 return False
         else:
-            print_log("更多活动", f"? 任务执行失败，状态码: {response.status_code}", account_index)
+            print_log("更多活动", f"❌ 任务执行失败，状态码: {response.status_code}", account_index)
             return False
             
     except Exception as e:
-        print_log("更多活动", f"? 执行任务时出错: {e}", account_index)
+        print_log("更多活动", f"❌ 执行任务时出错: {e}", account_index)
         return False
 
 def complete_more_activities(cookies, account_index=None):
@@ -608,7 +652,7 @@ def complete_more_activities(cookies, account_index=None):
             user_status = dashboard_data['userStatus']
             available_points = user_status.get('availablePoints', 0)
             lifetime_points = user_status.get('lifetimePoints', 0)
-            # print_log("更多活动", f"? 当前积分: {available_points}, 总积分: {lifetime_points}", account_index)
+            # print_log("更多活动", f"✅ 当前积分: {available_points}, 总积分: {lifetime_points}", account_index)
         
         # 提取更多活动任务
         more_promotions = dashboard_data.get('morePromotions', [])
@@ -627,7 +671,7 @@ def complete_more_activities(cookies, account_index=None):
             if execute_task(task, token, cookies, account_index):
                 completed_count += 1
             else:
-                print_log("更多活动", f"? 任务失败: {task.get('title', '未知任务')}", account_index)
+                print_log("更多活动", f"❌ 任务失败: {task.get('title', '未知任务')}", account_index)
             
             # 随机延迟
             time.sleep(random.uniform(2, 4))
@@ -722,7 +766,7 @@ def set_cached_init_points(email, date_str, points):
 def format_account_summary(dashboard_data, email, script_start_points, final_points, account_index=None):
     prefix = f"账号{account_index} - " if account_index is not None else "账号: "
     lines = [f"{prefix}{email}"]
-    lines.append(f"?积分变化: {script_start_points} -> {final_points} (+{final_points - script_start_points})")
+    lines.append(f"✨积分变化: {script_start_points} -> {final_points} (+{final_points - script_start_points})")
     # 搜索任务
     user_status = dashboard_data.get('userStatus', {})
     counters = user_status.get('counters', {})
@@ -731,20 +775,20 @@ def format_account_summary(dashboard_data, email, script_start_points, final_poi
         for task in search_tasks:
             title = task.get('title', label)
             progress = f"{task.get('pointProgress', 0)}/{task.get('pointProgressMax', 0)}"
-            lines.append(f"?{label}: {progress}")
+            lines.append(f"✅{label}: {progress}")
     # 每日活动
-    lines.append("?---------- 每日活动 ----------")
+    lines.append("✨---------- 每日活动 ----------")
     today_str = date.today().strftime('%m/%d/%Y')
     daily_tasks = dashboard_data.get('dailySetPromotions', {}).get(today_str, [])
     if daily_tasks:
         for task in daily_tasks:
             title = task.get('title', '每日任务')
-            complete = '?' if task.get('complete') else '?'
+            complete = '✅' if task.get('complete') else '❌'
             lines.append(f"{complete}{title}: {'已完成' if task.get('complete') else '未完成'}")
     else:
         lines.append("无每日活动任务")
     # 更多活动
-    lines.append("?---------- 更多活动 ----------")
+    lines.append("✨---------- 更多活动 ----------")
     more_tasks = dashboard_data.get('morePromotions', [])
     if more_tasks:
         for task in more_tasks:
@@ -752,7 +796,7 @@ def format_account_summary(dashboard_data, email, script_start_points, final_poi
             ppm = task.get('pointProgressMax', 0) or 0
             if ppm > 0:
                 title = task.get('title', '更多任务')
-                complete = '?' if task.get('complete') else '?'
+                complete = '✅' if task.get('complete') else '❌'
                 lines.append(f"{complete}{title}: {'已完成' if task.get('complete') else '未完成'}")
     else:
         lines.append("无更多活动任务")
@@ -791,6 +835,10 @@ def single_account_main(cookies, account_index):
     # 任务前dashboard_data不再用于推送
     dashboard_result = get_dashboard_data(cookies, account_index)
     dashboard_data = dashboard_result['dashboard_data'] if dashboard_result and 'dashboard_data' in dashboard_result else None
+    complete_daily_set_tasks(cookies, account_index)
+    print_log("每日活动", "【每日活动 - 已完成】", account_index)
+    complete_more_activities(cookies, account_index)
+    print_log("更多活动", "【更多活动 - 已完成】", account_index)
     if dashboard_data and not is_pc_search_complete(dashboard_data):
         perform_search_tasks("电脑搜索", lambda c, ai: bing_search_pc(c, ai, email), cookies, account_index)
     else:
@@ -801,10 +849,6 @@ def single_account_main(cookies, account_index):
         perform_search_tasks("移动搜索", lambda c, ai: bing_search_mobile(c, ai, email), cookies, account_index)
     else:
         print_log("移动搜索", "【移动搜索 - 已完成】", account_index)
-    complete_daily_set_tasks(cookies, account_index)
-    print_log("每日活动", "【每日活动 - 已完成】", account_index)
-    complete_more_activities(cookies, account_index)
-    print_log("更多活动", "【更多活动 - 已完成】", account_index)
     final_data = get_rewards_points(cookies, account_index)
     # 重新获取最新dashboard_data用于推送
     dashboard_result = get_dashboard_data(cookies, account_index)
@@ -812,7 +856,7 @@ def single_account_main(cookies, account_index):
     if final_data and final_data['points'] is not None:
         final_points = final_data['points']
         points_earned = final_points - script_start_points
-        print_log("脚本完成", f"? 最终积分：{final_points}（+{points_earned}）", account_index)
+        print_log("脚本完成", f"🎉 最终积分：{final_points}（+{points_earned}）", account_index)
         if dashboard_data:
             summary = format_account_summary(dashboard_data, email, script_start_points, final_points, account_index)
         else:
