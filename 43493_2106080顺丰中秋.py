@@ -261,3 +261,4 @@ if __name__ == '__main__':
         if info.strip():
             if not SFRunner(info, index).run():
                 continue
+
