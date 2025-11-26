@@ -1,4 +1,5 @@
-
+// @Date: 2025-09-19
+// @LastEditTime: 2025-09-22
 
 /*
 中国联通 
@@ -17,6 +18,7 @@ https://m.client.10010.com/mobileService/onLine.htm
 把请求体(body)里面的token_online参数填到变量 chinaUnicomCookie 里, 多账号换行或&或@隔开:
 export chinaUnicomCookie="a3e4c1ff25da2xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
+From:yaohuo28507
 cron: 0 0,7,20 * * *
 const $ = new Env("中国联通");
 */
@@ -46,6 +48,7 @@ const version = 2.08,
   appVersion = "iphone_c@11.0503",
   userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_1_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 unicom{version:" + appVersion + "}",
   appId = "86b8be06f56ba55e9fa7dff134c6b16c62ca7f319da4a958dd0afa0bf9f36f1daa9922869a8d2313b6f2f9f3b57f2901f0021c4575e4b6949ae18b7f6761d465c12321788dcd980aa1a641789d1188bb",
+  deviceCode="866265039370040",
   productId = "10000002",
   secretKey = "7k1HcDL8RKvc",
   defaultPassword = "woreadst^&*12345",
@@ -302,15 +305,15 @@ class UserService {
         if (timeoutOccurred) {
           this.log(`[${requestName}] 请求超时(${timeout / 1000}秒)，重试第${attemptCount}次`);
         } else if (protocolErrors.includes(errorCode)) {
-          this.log(`[${requestName}] 请求错误1[${errorCode}][${errorName}]`);
+          this.log(`[${requestName}] 请求错误[${errorCode}][${errorName}]`);
           if (error?.message) {
             console.log(error.message);
           }
           break;
         } else if (timeoutErrors.includes(errorName)) {
-          this.log(`[${requestName}] 请求错误2[${errorCode}][${errorName}]，重试第${attemptCount}次`);
+          this.log(`[${requestName}] 请求错误[${errorCode}][${errorName}]，重试第${attemptCount}次`);
         } else if (networkErrors.includes(errorCode)) {
-          this.log(`[${requestName}] 请求错误3[${errorCode}][${errorName}]，重试第${attemptCount}次`);
+          this.log(`[${requestName}] 请求错误[${errorCode}][${errorName}]，重试第${attemptCount}次`);
         } else {
           const statusCode = response?.statusCode || "";
           const statusCategory = Math.floor(statusCode / 100);
@@ -330,7 +333,7 @@ class UserService {
         if (err.name === "TimeoutError") {
           this.log(`[${requestName}] 请求超时，重试第${attemptCount}次`);
         } else {
-          this.log(`[${requestName}] 请求错误4(${err.message})，重试第${attemptCount}次`);
+          this.log(`[${requestName}] 请求错误(${err.message})，重试第${attemptCount}次`);
         }
       }
     }
@@ -496,7 +499,8 @@ class CustomUserService extends UserServiceClass {
           version: appVersion,
           step: "bindlist",
           isFirstInstall: 0,
-          deviceModel: "iPhone"
+          deviceModel: "iPhone",
+          deviceCode: deviceCode
         }
       };
   
@@ -732,7 +736,7 @@ class CustomUserService extends UserServiceClass {
       
       if (responseCode == 200) {
         const raffleCount = responseData?.data || 0;
-        //this.log(`权益超市可抽奖次数: ${raffleCount}`, { notify: true });
+        this.log(`权益超市可抽奖次数: ${raffleCount}`, { notify: true });
         return raffleCount;
       } else {
         let errorMessage = responseData?.msg || "未知错误";
@@ -765,6 +769,59 @@ class CustomUserService extends UserServiceClass {
     }
   }
 
+  async marketGetWateringRecords(options = {}) {
+    try {
+      if (!this.market_token) {
+        return null;
+      }
+
+      // 使用从QIIFE7RpzIttP Cookie中提取的有效yGdtco4r参数 - 查询浇花记录专用
+      const yGdtco4rParam = "0kJCZralqWoOyRFK5MqCRO_TUwsNq0Ppki8vaPIf5e62R0LorZOJN77zrWgTodj2QrQ3fdTC7EurWtWW79tUyudhWDdBVfTL6Dhcyz.t1D0jdvEuLZl30dKq0C.ucANSVPXjvcTTJr6G";
+      
+      const requestOptions = {
+        fn: "marketGetWateringRecords",
+        method: "get",
+        url: `https://backward.bol.wo.cn/prod-api/promotion/activityTaskRecord/getRangeRecordList?yGdtco4r=${yGdtco4rParam}`,
+        headers: {
+          "Host": "backward.bol.wo.cn",
+          "Connection": "keep-alive",
+          "sec-ch-ua-platform": '"Windows"',
+          "Authorization": `Bearer ${this.market_token}`,
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0",
+          "sec-ch-ua": '"Chromium";v="140", "Not=A?Brand";v="24", "Microsoft Edge";v="140"',
+          "Content-type": "application/json",
+          "sec-ch-ua-mobile": "?0",
+          "Accept": "*/*",
+          "Sec-Fetch-Site": "same-origin",
+          "Sec-Fetch-Mode": "cors",
+          "Sec-Fetch-Dest": "empty",
+          "Referer": "https://backward.bol.wo.cn/market",
+          "Accept-Encoding": "gzip, deflate, br, zstd",
+          "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6"
+        }
+      };
+
+      let response = await this.request(requestOptions);
+      let { result: responseData, statusCode: responseStatus } = response;
+      let responseCode = appName.get(responseData, "code", responseStatus);
+      
+      if (responseCode == 200) {
+        const data = responseData?.data;
+        if (data && Array.isArray(data)) {
+          return data;
+        }
+      } else {
+        let errorMessage = responseData?.msg || "未知错误";
+        this.log("获取浇花记录失败[" + responseCode + "]: " + errorMessage);
+      }
+      
+      return null;
+    } catch (error) {
+      this.log(`获取浇花记录异常: ${error.message}`);
+      return null;
+    }
+  }
+
   async marketGetWateringStatus(options = {}) {
     try {
       if (!this.market_token) {
@@ -774,10 +831,10 @@ class CustomUserService extends UserServiceClass {
       // 使用从QIIFE7RpzIttP Cookie中提取的有效yGdtco4r参数 - 查询浇花状态专用
       const yGdtco4rParam = "0hHgWnaEqWi0546ZdRfTeDqJdMBnv_KnzWG6CMU_1bgJe_DjIYJ6DF2QyCn39IVIop_Tl2MtZLEma_cOOBnd3rwlPuPDGi1VtWWYtqBx07xlMOjYRpb2aAZiH1jlx_PLjqQGzoPj1AUFWj9PwC1ELJq3oEw7mi.Vql7wNyVD4unkqvNgLlHPAB4jQSgOYaStVs9LtDqXn3Uw.6UKM2k1gpbGxW.lj8Oz0sNFL2dqf7HoG_5qG2_3427RzOlc8BTQC41UZTOVZWFgIzUN_5ieBSJuEPSrITbbJjOBKfau06OimtckkiRVxQAdTBLmSGvN0Iqp5sZcyRhPnAxWP7rDP1uWG5WMdzfW44SEwjr55XfNLUS.c7rSClxax2RBT3wP.xuYSxawy1OgFrQgIGLIJQx6.7LScnfvwchuTaf.aPkn53J2iXVfb6WPxm1BjYeFvjy1v8HuPMixeh3GGJPj_7rPLIbTUcsPYLwpLcdIbYU5bMjlqaxzfdbuUQnqAEUrh5Fqq2WUkHPwHTrnehvEbvBsn.YZksQODgRjV5Oa9lcbo5dD6fbPbO2E";
       
-              const requestOptions = {
-          fn: "marketGetWateringStatus",
-          method: "get",
-          url: `https://backward.bol.wo.cn/prod-api/promotion/activityTask/getMultiCycleProcess?activityId=13&yGdtco4r=${yGdtco4rParam}`,
+      const requestOptions = {
+        fn: "marketGetWateringStatus",
+        method: "get",
+        url: `https://backward.bol.wo.cn/prod-api/promotion/activityTask/getMultiCycleProcess?activityId=13&yGdtco4r=${yGdtco4rParam}`,
         headers: {
           "Host": "backward.bol.wo.cn",
           "Connection": "keep-alive",
@@ -886,17 +943,29 @@ class CustomUserService extends UserServiceClass {
         return;
       }
 
-      // 检查今日浇花状态
-      const wateringStatus = await this.marketGetWateringStatus();
+      // 获取浇花记录列表判断今日是否已浇花
+      const wateringRecords = await this.marketGetWateringRecords();
       
-      if (!wateringStatus) {
-        this.log("获取浇花状态失败，跳过浇花");
+      if (!wateringRecords) {
+        this.log("获取浇花记录失败，跳过浇花");
         return;
       }
 
-      const triggeredTime = wateringStatus.triggeredTime || 0;
+      // 获取今天的日期字符串 (YYYY-MM-DD)
+      const today = new Date();
+      const todayStr = new Date(Date.now() + 8 * 3600 * 1000).toISOString().split('T')[0];
       
-      if (triggeredTime === 0) {
+      // 查找今天的浇花记录
+      const todayRecord = wateringRecords.find(record => {
+        if (record.createTime) {
+          const recordDate = record.createTime.split(' ')[0]; // 取日期部分
+          return recordDate === todayStr;
+        }
+        return false;
+      });
+
+      if (!todayRecord) {
+        // 今日未浇花，执行浇花
         this.log("今日尚未浇花，开始执行浇花", { notify: true });
         const success = await this.marketWatering();
         
@@ -906,11 +975,92 @@ class CustomUserService extends UserServiceClass {
           this.log("权益超市浇花失败");
         }
       } else {
-        this.log("今日已完成浇花", { notify: true });
+        // 今日已浇花，获取正确的浇花状态信息
+        const wateringStatus = await this.marketGetWateringStatus();
+        
+        if (wateringStatus) {
+          const triggeredTime = wateringStatus.triggeredTime || 0;
+          const triggerTime = wateringStatus.triggerTime || 0;
+          this.log(`今日浇花已完成，已浇花 ${triggeredTime}/${triggerTime} 次，浇花时间: ${todayRecord.createTime}`, { notify: true });
+        } else {
+          this.log(`今日浇花已完成，浇花时间: ${todayRecord.createTime}`, { notify: true });
+        }
       }
       
     } catch (error) {
       this.log(`权益超市浇花任务异常: ${error.message}`);
+    }
+  }
+
+  async marketRaffle(options = {}) {
+    try {
+      if (!this.market_token) {
+        return false;
+      }
+
+      // 使用从QIIFE7RpzIttP Cookie中提取的有效yGdtco4r参数 - 执行抽奖专用
+      const yGdtco4rParam = "0QgDw1GEqWlrU036_dbyBvP8.68dggpJ9Em3UEzaRWLwzFshel7nj1kEQxCiI.B_fIDMRTiEwAgmaoqRDUcMB02lgYQPCAFCba8gFHC.tOt7HgTxZYK9RE.F97mWLrjhVnYlqoN8J3po8lAf4nuZgZxrqLz7G5RwjhP7cN6MJqMz919_MDvcHYn6NwWXQSzGz5SeQ6gXKTjWH7e169QJLUmSffMJtRvnmSI_KAoFD1KO900oYqqNE6DT3Ldqrybha.30hJjF5xcVVGKG5PjvpDN6mh_OkWCUntXfjKcpHOiq.ihFEmTnbaizklLV9QFuwD7d_64uWO.ccQ_YBp9GGcRNUyedvs7aY349tZSdJUJMs5AxGNoRN9kBfA0fs5zcrT9nHG8j7qYcaEgq4ZCXkOHtGohgHad2DFiRfkhDH0vf0XA0iAczitXuNfNIrzql7wpGW3qduE7AwzbWxKpDrohiS_aikqbAInv00OAPevfIw8v23ugpy8URgEdXFWaBUA_ZYw6MCplOhwvSiHK0Js1hcBQSehpn2xwE3a6yaDjY3NxVZ.m5A4sG";
+      
+      const requestOptions = {
+        fn: "marketRaffle",
+        method: "post",
+        url: `https://backward.bol.wo.cn/prod-api/promotion/home/raffleActivity/userRaffle?yGdtco4r=${yGdtco4rParam}`,
+        headers: {
+          "Host": "backward.bol.wo.cn",
+          "Connection": "keep-alive",
+          "Content-Length": "0",
+          "Pragma": "no-cache",
+          "Cache-Control": "no-cache",
+          "sec-ch-ua-platform": '"Android"',
+          "Authorization": `Bearer ${this.market_token}`,
+          "User-Agent": "Mozilla/5.0 (Linux; Android 9; ONEPLUS A5000 Build/PKQ1.180716.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/138.0.7204.179 Mobile Safari/537.36; unicom{version:android@11.0000,desmobile:0};devicetype{deviceBrand:OnePlus,deviceModel:ONEPLUS A5000}",
+          "Accept": "application/json, text/plain, */*",
+          "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Android WebView";v="138"',
+          "sec-ch-ua-mobile": "?1",
+          "Origin": "https://contact.bol.wo.cn",
+          "X-Requested-With": "com.sinovatech.unicom.ui",
+          "Sec-Fetch-Site": "same-site",
+          "Sec-Fetch-Mode": "cors",
+          "Sec-Fetch-Dest": "empty",
+          "Referer": "https://contact.bol.wo.cn/",
+          "Accept-Encoding": "gzip, deflate, br, zstd",
+          "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"
+        }
+      };
+
+      let response = await this.request(requestOptions);
+      let { result: responseData, statusCode: responseStatus } = response;
+      let responseCode = appName.get(responseData, "code", responseStatus);
+      
+      if (responseCode == 200) {
+        const data = responseData?.data;
+        if (data) {
+          const isWinning = data.isWinning;
+          const prizesName = data.prizesName || "未中奖";
+          const message = data.message;
+          
+          if (isWinning) {
+            this.log(`权益超市抽奖成功: ${prizesName}`, { notify: true });
+          } else {
+            this.log(`权益超市抽奖结果: ${prizesName}`, { notify: true });
+          }
+          
+          if (message) {
+            this.log(`抽奖提示: ${message}`);
+          }
+          
+          return true;
+        }
+        return false;
+      } else {
+        let errorMessage = responseData?.msg || "未知错误";
+        this.log("权益超市抽奖失败[" + responseCode + "]: " + errorMessage);
+        return false;
+      }
+      
+    } catch (error) {
+      this.log(`权益超市抽奖异常: ${error.message}`);
+      return false;
     }
   }
 
@@ -924,15 +1074,15 @@ class CustomUserService extends UserServiceClass {
       const raffleCount = await this.marketGetRaffleCount();
       
       if (raffleCount > 0) {
-        //this.log(`开始执行权益超市抽奖，可抽奖次数: ${raffleCount}`, { notify: true });
+        this.log(`开始执行权益超市抽奖，可抽奖次数: ${raffleCount}`, { notify: true });
         
         // 执行抽奖
         for (let i = 0; i < raffleCount; i++) {
-          //this.log(`执行第 ${i + 1} 次抽奖`);
+          this.log(`执行第 ${i + 1} 次抽奖`);
           const success = await this.marketRaffle();
           
           if (!success) {
-            //this.log(`第 ${i + 1} 次抽奖失败，停止抽奖`);
+            this.log(`第 ${i + 1} 次抽奖失败，停止抽奖`);
             break;
           }
           
@@ -940,13 +1090,13 @@ class CustomUserService extends UserServiceClass {
           await appName.wait(3000);
         }
         
-        //this.log("权益超市抽奖完成", { notify: true });
+        this.log("权益超市抽奖完成", { notify: true });
       } else {
-        //this.log("权益超市暂无可抽奖次数", { notify: true });
+        this.log("权益超市暂无可抽奖次数", { notify: true });
       }
       
     } catch (error) {
-      //this.log(`权益超市抽奖异常: ${error.message}`);
+      this.log(`权益超市抽奖异常: ${error.message}`);
     }
   }
   
@@ -4559,10 +4709,10 @@ async sign_doTask(_0x4cf867, _0x22748d, _0x5bbfdb = {}) {
       await this.sign_task();
     }
     await this.ttlxj_task();
-    await this.ltyp_task();
-    await this.epay_28_task();
-    await this.draw_28_task();
-    await this.card_618_task();
+    // await this.ltyp_task();
+    // await this.epay_28_task();
+    // await this.draw_28_task();
+    // await this.card_618_task();
     if (!ltzfDisabled) {
       await this.ltzf_task();
     }
