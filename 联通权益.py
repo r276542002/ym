@@ -1,540 +1,701 @@
-'''
-不想抽奖后自动领取的就注释掉isGrantPrize = True
-isGrantPrize = True
-isGrantPrize = True  是否抽奖完成自动领取
-draw_before= True
-draw_before= True  是否领取以前的权益
-变量:
-    青龙变量为
-        chinaUnicomCookie
-    本地运行替换
-        token1&token2&token3
-至于多token格式支持多种并且可混用   & ^  %  回车  如果想自己添加其他自己改。
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# 中国联通权益超市自动任务脚本（修复版）
+# 账号变量格式: UNICOM_ACCOUNTS=手机号1#ecs_token1\n手机号2#ecs_token2\n...
+# 或者: UNICOM_ACCOUNTS=手机号1#token_online1#appid1\n手机号2#token_online2#appid2\n...
 
-登录失败也会有,自己加同ip下appid 或者同ip下登录app再运行。多次失败或者502那就换个时间段运行吧。
-
-
-    &方式:token1&token2&token3
-
-    %方式:token1%token2%token3
-    
-    ^方式:token1^token2^token3
-
-    回车方式:
-    token1
-    token2
-    token3
-
-加其他接口也可参考(https://contact.bol.wo.cn/market-act/js/app.js)
-
-by:翼城
-
-'''
 import os
+import io
 import re
+import sys
+import time
 import json
-import certifi
-import httpx
-import asyncio
+import base64
+import random
 import logging
+import binascii
+import requests
+import threading
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from typing import Optional
+from notify import send
+from threading import Event
+from collections import deque
+from datetime import datetime
+from datetime import datetime, timedelta
 from prettytable import PrettyTable
+from typing import List, Optional
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
 from urllib.parse import urlparse, parse_qs
-import ssl
-class Config:
-    def __init__(self, draw_before=False,isGrantPrize=False, allOrSingle=False):
-        self.draw_before = draw_before #领取以前的权益 True  开启 False  关闭
-        self.isGrantPrize = isGrantPrize #抽奖完成自动领取
-        self.allOrSingle = allOrSingle #是否许愿全部默认单个---->许愿全部上面:allOrSingle=True,许愿单个:allOrSingle=False
-        self.split_pattern=  r'[\n&^@%]+'
-    def toggle_draw_before(self):
-        self.draw_before = not self.draw_before
-        self.isGrantPrize = not self.isGrantPrize
-        self.allOrSingle = not self.allOrSingle
+from requests.exceptions import ReadTimeout
+from requests.exceptions import RequestException, ConnectionError, Timeout, HTTPError
+from urllib3.exceptions import NameResolutionError, NewConnectionError
+from requests.exceptions import RequestException, HTTPError
+from urllib3.exceptions import NewConnectionError, MaxRetryError, NameResolutionError
 
+# 配置开关
+GrantPrize = True  # 权益超市自动领奖：启用True/禁用False
 
-class AsyncSessionManager:
-    def __init__(self, timeout=None, verify=True, ca_certs=None):
-        self.client = None
-        self.timeout = timeout
-        self.verify = verify
-        self.ca_certs = ca_certs
+# ================================================
+# 日志配置
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(message)s'
+)
 
-    async def __aenter__(self):
-        if self.timeout:
-            self.client = httpx.AsyncClient(
-                limits=httpx.Limits(max_connections=1000),
-                timeout=self.timeout,
-                verify=self._get_verify(self.verify, self.ca_certs)
-            )
-        else:
-            self.client = httpx.AsyncClient(
-                limits=httpx.Limits(max_connections=1000),
-                verify=self._get_verify(self.verify, self.ca_certs)
-            )
-        return self.client
+class MillisecondFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        if datefmt is None:
+            datefmt = "%Y-%m-%d %H:%M:%S.%f"
+        dt = datetime.fromtimestamp(record.created)
+        s = dt.strftime(datefmt)
+        return s[:-3]  # 毫秒精度
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.client.aclose()
+# 应用毫秒格式到控制台 handler
+console_handler = logging.getLogger().handlers[0]
+console_handler.setFormatter(MillisecondFormatter('[%(asctime)s] %(message)s'))
 
-    def _get_verify(self, verify, ca_certs):
-        if verify:
-            if ca_certs:
-                return ca_certs
-            else:
-                return True
-        else:
-            return False
+# 线程安全封装打印
+def log_with_time(message: str, proxy: Optional[str] = None):
+    if proxy:
+        message = f"[代理：{proxy}] {message}"
+    logging.info(message)
 
-async def mask_middle_four(value):
-    if isinstance(value, str):
-        if len(value) >= 11:
-            return value[:3] + "####" + value[-4:]
-        else:
-            raise ValueError("输入的字符串长度不足以截取中间四位")
-    else:
-        raise TypeError("输入类型错误，应为字符串")
-config = Config()  
-class NoDuplicatesFilter(logging.Filter):
-    def __init__(self):
-        self._logged = set()
+# 全局会话
+shared_session = requests.Session()
+adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=Retry(total=3, backoff_factor=0.3))
+shared_session.mount("http://", adapter)
+shared_session.mount("https://", adapter)
 
-    def filter(self, record):
-        msg = record.getMessage()
-        if msg in self._logged:
-            return False
-        self._logged.add(msg)
-        return True
+# ================================================
+# 代理管理类
+class ProxyManager:
+    def __init__(self, get_proxy_func, limit=10):
+        self.get_proxy_func = get_proxy_func
+        self.limit = limit
+        self.request_count = 0
+        self.current_proxy = self.get_proxy_func()
+        self.lock = threading.Lock()
+        self.recent_proxies = deque(maxlen=5)
 
-class TaskProcessor:
-    def __init__(self, ltToken):
-        self.ltToken = ltToken
-        self.userToken = None
-        self.ecs_token = None
-        self.share_name = None
-        self.share_param = None
-        self.currPhone = None
-        self.Phones = None
-        self.shareList = []
-        self.userProbabilityList = []
-        self.userProbability = []
-        self.urls = {
-            'onLine': "https://m.client.10010.com/mobileService/onLine.htm",
-            'ticket': "https://m.client.10010.com/mobileService/openPlatform/openPlatLineNew.htm?to_url=https://contact.bol.wo.cn/market",
-            'marketUnicomLogin': "https://backward.bol.wo.cn/prod-api/auth/marketUnicomLogin",
-            'getAllActivityTasks': "https://backward.bol.wo.cn/prod-api/promotion/activityTask/getAllActivityTasks?activityId=12",
-            'checkShare': "https://backward.bol.wo.cn/prod-api/promotion/activityTaskShare/checkShare",
-            'checkView':   "https://backward.bol.wo.cn/prod-api/promotion/activityTaskShare/checkView",
-            'checkHelp': "https://backward.bol.wo.cn/prod-api/promotion/activityTaskShare/checkHelp",
-            'getUserRaffleCount': "https://backward.bol.wo.cn/prod-api/promotion/home/raffleActivity/getUserRaffleCount?id=12",
-            'userRaffle': "https://backward.bol.wo.cn/prod-api/promotion/home/raffleActivity/userRaffle?id=12&channel=",
-            'validateCaptcha': "https://backward.bol.wo.cn/prod-api/promotion/home/raffleActivity/validateCaptcha?id=12",
-            'grantPrize': "https://backward.bol.wo.cn/prod-api/promotion/home/raffleActivity/grantPrize",
-            'getMyPrize': "https://backward.bol.wo.cn/prod-api/promotion/home/raffleActivity/getMyPrize",
-            'userProbability': "https://backward.bol.wo.cn/prod-api/promotion/home/raffleActivity/userProbability",
-            'userProbabilityPrizeList': "https://backward.bol.wo.cn/prod-api/promotion/home/raffleActivity/userProbabilityPrizeList?configId=12",
-            'xyprizeList': "https://backward.bol.wo.cn/prod-api/promotion/home/raffleActivity/prizeList?id=12",
-        }
-        self.headers = {
-            'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 12; leijun Pro Build/SKQ1.22013.001);unicom{version:android@11.0702}",
-            'Connection': "Keep-Alive",
-            'Accept-Encoding': "gzip",
-        }
-        self.common_value = None  
-
-    async def get_ecstoken(self, session):
-        payload = {
-            'isFirstInstall': "1",
-            'version': "android@11.0702",
-            'token_online': self.ltToken
-        }
-        response_Value = await self.requestsPost('onLine', payload, session)
-        try:
-            valueJson=json.loads(response_Value)
-            await asyncio.sleep(1)
-            desmobile=valueJson.get("desmobile")
-            if desmobile is None:
-                print("未获取到手机号",valueJson.get("dsc"))
+    def get_proxy(self):
+        with self.lock:
+            if self.current_proxy is None:
                 return None
-            self.currPhone=await mask_middle_four(desmobile);
-            self.Phone=(desmobile);
-            value=valueJson.get("ecs_token")
-            self.ecs_token=value
-            return value
-        except  json.JSONDecodeError:
-            print("get_ecstoken json error",response_Value)
-            return None
-    async def get_ticket(self, session):
-        response_Value = await self.requestsGet('ticket',session)
+
+            if self.request_count >= self.limit:
+                self.switch_proxy()
+
+            proxy_to_use = self.current_proxy
+            self.request_count += 1
+
+            return {"http": f"http://{proxy_to_use}", "https": f"http://{proxy_to_use}"}
+
+    def switch_proxy(self):
+        old = self.current_proxy
+        new_proxy = None
+
+        for _ in range(5):
+            candidate = self.get_proxy_func()
+            if candidate and candidate not in self.recent_proxies:
+                new_proxy = candidate
+                break
+            time.sleep(0.1)
+
+        if not new_proxy:
+            new_proxy = self.get_proxy_func()
+
+        self.recent_proxies.append(new_proxy)
+        self.current_proxy = new_proxy
+        self.request_count = 0
+        if self.current_proxy:
+            log_with_time(f"🔁 切换代理：{old} ➡️ {self.current_proxy}")
+
+# ================================================
+# 代理IP获取函数
+def get_proxyIP(max_retries=3):
+    proxy_url = os.getenv("ProxyIP")
+    if not proxy_url:
+        return None
+
+    for attempt in range(max_retries):
         try:
-            parsed_url = urlparse(response_Value)
-            print(parsed_url)
-            query_params = parse_qs(parsed_url.query)
-            ticket = query_params.get('ticket', [None])[0] 
-            self.ticket=ticket
-            return ticket
-        except  json.JSONDecodeError:
-            print("get_ticket json error")
-            return None
+            response = requests.get(proxy_url, timeout=5)
+            proxy_ip = response.text.strip()
+            if re.match(r'^\d+\.\d+\.\d+\.\d+:\d+$', proxy_ip):
+                return proxy_ip
+
+            res = response.json()
+            if res.get('code') == -1:
+                print(f"[代理异常] {res.get('message', '未知错误')}")
+                return None
+
         except Exception as e:
-            print(f"error: {e}")
-            return None
+            print(f"[提取代理失败] 第 {attempt + 1} 次重试: {e}")
+            time.sleep(1)
+    return None
 
-    async def get_qycslogin(self, session):
-        payload = {
-            
-        }
-        response_Value = await self.requestsPost('marketUnicomLogin',payload,  session)
-        try:
-            token=json.loads(response_Value).get("data").get("token")
-            self.userToken=token
-            print(token)
-            return token
-        except  json.JSONDecodeError:
-            print("get_qycslogin json error",response_Value)
-            return None
+# ================================================
+# 主要API类
+class ChinaunicomAPI:
+    def __init__(self, account_list: List[str]):
+        self.GrantPrize = GrantPrize
+        self.phone_list = []
+        self.ecs_token_list = []  # 存储ecs_token
+        self.online_token_list = []  # 存储token_online
+        self.appid_list = []  # 存储appid
+        self.user_data: List[Optional[dict]] = []
+        self.proxies = {}
         
-    async def get_qycsxy(self, session,delay):
-        xyList=[]
-        if config.allOrSingle:
-            await self.get_qycsxyprizeList(session)#查询所有许愿任务
-            xyList=self.userProbabilityList
+        # 解析账号信息（支持两种格式）
+        for entry in account_list:
+            entry = entry.strip()
+            if not entry:
+                continue
+
+            parts = entry.split('#')
+            if len(parts) == 2:
+                # 格式1: 手机号#ecs_token
+                self.phone_list.append(parts[0])
+                self.ecs_token_list.append(parts[1])
+                self.online_token_list.append(None)
+                self.appid_list.append(None)
+            elif len(parts) >= 3:
+                # 格式2: 手机号#token_online#appid
+                self.phone_list.append(parts[0])
+                self.ecs_token_list.append(None)
+                self.online_token_list.append(parts[1])
+                self.appid_list.append(parts[2])
+
+        # 为每个手机号创建代理管理器
+        for phone in self.phone_list:
+            masked_phone = f"{phone[:3]}****{phone[-4:]}"
+            self.proxies[masked_phone] = ProxyManager(get_proxyIP)
+
+    # ============================================
+    # 请求头封装
+    def get_headers(self, Isheaders=None):
+        if Isheaders == 1:
+            headers={
+                "User-Agent": "Mozilla/5.0 (Linux; Android 11; Redmi Note 10 Pro Build/RP1A.201005.004; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/92.0.4515.159 Mobile Safari/537.36",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Encoding": "gzip, deflate, br, zstd",
+                "Pragma": "no-cache",
+                "Cache-Control": "no-cache",
+                "sec-ch-ua": '"Android WebView";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
+                "accesstoken": "ODZERTZCMjA1NTg1MTFFNDNFMThDRDYw",
+                "Content-Type": "application/json;charset=UTF-8",
+                "Origin": "https://10010.woread.com.cn",
+                "X-Requested-With": "com.sinovatech.unicom.ui",
+                "Referer": "https://10010.woread.com.cn/ng_woread/",
+                "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"
+            }
+        elif Isheaders == 2:
+            headers={
+                'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 12; leijun Pro Build/SKQ1.22013.001);unicom{version:android@11.0702}",
+                'Connection': "Keep-Alive",
+                'Accept-Encoding': "gzip"
+            }
         else:
-            await self.get_qycsuserProbabilityPrizeList(session)#查询单许愿任务
-            xyList=self.userProbability
-        await asyncio.sleep(delay)
-        if xyList is not None and len(xyList)>0:
-            for item in (xyList):
-                await self.get_qycsuserProbability(session,item)#许愿任务
-        await asyncio.sleep(delay)
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Linux; Android 11; Redmi Note 10 Pro Build/RP1A.201005.004; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/92.0.4515.159 Mobile Safari/537.36",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Encoding": "gzip, deflate, br, zstd",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+                "sec-ch-ua": '"Android WebView";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
+                "Content-Type": "application/json;charset=UTF-8",
+                "Origin": "https://10010.woread.com.cn",
+                "X-Requested-With": "com.sinovatech.unicom.ui",
+                "Referer": "https://10010.woread.com.cn/ng_woread/",
+                "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"
+            }
 
+        return headers
 
-
-    async def get_qycsgetMyPrize(self, session):
-        payload = {
-            "id": 12,
-            "type": 0,
-            "page": 1,
-            "limit": 100,
-        }
-        payload=json.dumps(payload)
-        response_Value = await self.requestsPost('getMyPrize',payload,  session)
-        try:
-            jsonValue = json.loads(response_Value)
-            lists = jsonValue.get("data", {}).get("list", [])
-            table = PrettyTable()
-            if lists:
-                table.title = f"开始统计{self.Phone}因太懒而未领取奖品信息"
-                table.field_names = ["商品名称", "商品id", "领取时间", "失效时间"]
-                for item in lists:
-                    id =item.get("id")
-                    prizesName =item.get("prizesName")
-                    createTime =item.get("createTime")
-                    deadline =item.get("deadline")
-                    if config.draw_before:
-                        await self.get_qycsgrantPrize(session,id,prizesName)
-                    else:
-                        table.add_row([item.get("prizesName"), id, createTime,deadline])
+    # ============================================
+    # 请求封装
+    def do_send(self, url: str, method: str = "GET", data: Optional[dict] = None, 
+                headers: Optional[dict] = None, timeout: float = 10, max_retries: int = 3, 
+                show_resp: bool = False, proxy_manager: Optional[ProxyManager] = None, 
+                allow_redirects: bool = True) -> requests.Response:
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                proxies = proxy_manager.get_proxy() if proxy_manager else None
                 
-            else:
-                table.field_names = [f"{self.currPhone}没有奖品待领取"]
-            print(table)
-
-            return lists
-        except  json.JSONDecodeError:
-            print("get_qycsgetMyPrize json error",response_Value)
-            return None
-    async def get_qycsgrantPrize(self, session,lotteryRecordId,name):
-        payload = {
-            "recordId": lotteryRecordId,
-        }
-        payload=json.dumps(payload)
-        response_Value = await self.requestsPost('grantPrize',payload,  session)
-        try:
-            msg=json.loads(response_Value).get("msg")
-            print(f"{name}领取->",msg)
-        except  json.JSONDecodeError:
-            print("get_qycsgrantPrize json error",response_Value)
-            return None
-    async def get_qycsuserRaffle(self, session,num=3):
-        payload = {
-            
-        }
-        response_Value = await self.requestsPost('userRaffle',payload,  session)
-        try:
-            response_Value=json.loads(response_Value)
-            if response_Value.get("code")==200:
-                num=0
-                if response_Value.get("data"):
-                    lotteryRecordId=response_Value.get("data").get("lotteryRecordId")
-                    prizesName=response_Value.get("data").get("prizesName")
-                    print(f"{self.currPhone}:抽奖成功:",prizesName)
-                    if config.isGrantPrize==True:
-                        print(f"{self.currPhone}:开始领取:",prizesName)
-                        await self.get_qycsgrantPrize(session,lotteryRecordId,prizesName)
+                if method.upper() == "GET":
+                    if data:
+                        params = data
+                        resp = shared_session.get(url, params=params, headers=headers, timeout=timeout, 
+                                                proxies=proxies, allow_redirects=allow_redirects)
                     else:
-                        print(f"{self.currPhone}:不执行领取:",prizesName)
-                return response_Value
-            elif response_Value.get("code")==500:
-                await self.get_qycsvalidateCaptcha(session)
-                if num > 1: 
-                    await self.get_qycsuserRaffle(session, num - 1)
-            else:
-                print("没有更多的尝试次数")
-
-        except  json.JSONDecodeError as e:
-            print(f"get_qycsuserRaffle error: {e}")
-            return None
-        
-    async def get_qycsvalidateCaptcha(self, session):
-        payload = {
-            
-        }
-        response_Value = await self.requestsPost('validateCaptcha',payload,  session)
-        try:
-            response_Value=json.loads(response_Value)
-            if response_Value.get("code")==200:
-                print(f"{self.currPhone}:人机验证成功")
-            elif response_Value.get("code")==500:
-                print(f"{self.currPhone}:人机验证失败")
-        except  json.JSONDecodeError:
-            print("get_qycsuserRaffle2 json error")
-            return None
-        
-
-    async def get_qycscheckShareList(self, session):
-        payload = {
-            
-        }
-        shareLists=self.shareList;
-        for shareList in shareLists:
-            self.share_name=shareList.get("name")
-            self.share_param=shareList.get("param")
-            if self.share_param is not None:
-                checkValue="checkShare"
-                try:
-                    if ("浏览") in shareList.get("name"):
-                        checkValue="checkView"
+                        resp = shared_session.get(url, headers=headers, timeout=timeout, 
+                                                proxies=proxies, allow_redirects=allow_redirects)
+                else:
+                    if data and isinstance(data, dict):
+                        if "token_online" in data:
+                            resp = shared_session.request(method=method.upper(), url=url, data=data, 
+                                                        headers=headers, timeout=timeout, 
+                                                        proxies=proxies, allow_redirects=allow_redirects)
+                        else:
+                            resp = shared_session.request(method=method.upper(), url=url, json=data, 
+                                                        headers=headers, timeout=timeout, 
+                                                        proxies=proxies, allow_redirects=allow_redirects)
                     else:
-                        checkValue="checkShare"#留待后续接口补充
+                        resp = shared_session.request(method=method.upper(), url=url, headers=headers, 
+                                                    timeout=timeout, proxies=proxies, 
+                                                    allow_redirects=allow_redirects)
 
-                    response_Value = await self.requestsPost(checkValue,payload,  session)
-                    msg=json.loads(response_Value).get("msg")
-                    code=json.loads(response_Value).get("code")
-                    if code==200 or msg=="操作成功":
-                        print(f"{self.currPhone}:{self.share_name}->:"+msg)
+                if show_resp:
+                    print(f"[Response][{resp.status_code}] {resp.text}")
 
-                except  json.JSONDecodeError:
-                    print("get_qycscheckShare json error")
-                    return None
-            else:
-                pass
-    async def get_qycsUserRaffleCount(self, session):
-        payload = {
-            
-        }
-        response_Value = await self.requestsPost('getUserRaffleCount',payload,  session)
+                resp.raise_for_status()
+                
+                if resp.status_code == 302:
+                    return resp
+                else:
+                    return resp.json()
+                
+            except requests.exceptions.HTTPError as e:
+                raise
+
+            except ConnectionError as e:
+                if isinstance(e.args[0], NewConnectionError):
+                    print(f"🔴 连接失败，第{attempt}次重试")
+
+            except requests.exceptions.ConnectionError as e:
+                if hasattr(e, 'args') and len(e.args) > 0 and isinstance(e.args[0], NameResolutionError):
+                    print(f"🔴 DNS解析失败: 第{attempt}次重试")
+
+            except ReadTimeout as e:
+                print(f"🔴 请求超时，第{attempt}次重试")
+
+            except requests.exceptions.RequestException as e:
+                print(f"🔴 请求失败，第{attempt} 次重试: {e}")
+                if attempt == max_retries:
+                    print("🔴 已达最大重试次数")
+                    raise
+
+    # ============================================
+    # 权益超市相关方法
+    
+    # 获取Ticket
+    def get_ticket(self, ecs_token):
+        url = "https://m.client.10010.com/mobileService/openPlatform/openPlatLineNew.htm?to_url=https://contact.bol.wo.cn/market"
+        headers = self.get_headers(Isheaders=2)
+        headers['Cookie'] = 'ecs_token=' + ecs_token
+        
         try:
-            data=json.loads(response_Value).get("data")
+            resp = self.do_send(url, method="GET", headers=headers, allow_redirects=False, show_resp=False)
+            if hasattr(resp, 'status_code') and resp.status_code == 302:
+                location = resp.headers.get("Location", "")
+                parsed_url = urlparse(location)
+                query_params = parse_qs(parsed_url.query)
+                ticket_list = query_params.get("ticket")
+                ticket = ticket_list[0] if ticket_list else None
+                if ticket:
+                    return ticket
 
-            return data
-        except  json.JSONDecodeError:
-            print("get_qycsUserRaffleCount json error",response_Value)
-            return None
-    async def get_qycsuserProbability(self, session,item):
-
-        payload = {
-        "id":item.get("id")or item.get("prizesId") or 3,
-        "lotteryConfigId": item.get("lotteryConfigId") or 12,
-        "prizeName": item.get("prizeName") or item.get("name") or item.get("prizesname") or "哔哩哔哩月度大会员",
-        "prizeId":item.get("id")or item.get("prizesId") or 3,
-        "sortOrder":item.get("sortOrder")or item.get("manualRedemptionMethod") or 2,
-        "imageUrl":item.get("imageUrl")or 'https://contact.bol.wo.cn/contact-file/2024/06/11/e2cff84f6b1b418a89426bfaf1dcb6f8png',
-        }
-        # 下面放开是固定领某个,至于多个id,先改allOrSingle=True  再搜--->打印所有待许愿的奖品<----把日志放开就行了   
-        # payload = {
-        #     "id": 3,
-        #     "lotteryConfigId": 12,
-        #     "prizeId": 3,
-        #     "sortOrder": 2,
-        #     "prizeName": "哔哩哔哩月度大会员",
-        #     "imageUrl": "https://contact.bol.wo.cn/contact-file/2024/06/11/e2cff84f6b1b418a89426bfaf1dcb6f8png",
-        # }
-        payload=json.dumps(payload)
-        response_Value = await self.requestsPost('userProbability',payload,  session)
-        try:
-            jsonData=json.loads(response_Value)    
-            data=jsonData.get("data")
-            if jsonData.get("code")!=200:
-                print(f"{self.currPhone}:许愿失败:{jsonData.get('msg')}")
-                return None
-            prizeName=item.get("prizeName") or item.get("name") or item.get("prizesname")
-            print(f"{prizeName}:许愿成功!")
-            return data
-        except  json.JSONDecodeError:
-            print("get_qycsUserRaffleCount json error",response_Value)
-            return None
-    async def get_qycsxyprizeList(self, session):
-        payload = {
-
-        }
-        response_Value = await self.requestsPost('xyprizeList',payload,  session)
-        try:
-            data=json.loads(response_Value).get("data")
-            if data is not None and len(data)>0:
-                for item in data:
-                    userProbability = {
-                        "prizesname": item.get("name"),
-                        "prizesId": item.get("prizesId"),
-                        "type": item.get("type"),
-                        "imageUrl": item.get("imageUrl"),
-                        "manualRedemptionMethod": item.get("manualRedemptionMethod"),
-                    }
-                    self.userProbabilityList.append(userProbability)
-            # print(data)#打印所有待许愿的奖品
-            return data
-        except  json.JSONDecodeError:
-            print("get_qycsUserRaffleCount json error",response_Value)
-            return None
-    async def get_qycsuserProbabilityPrizeList(self, session):
-        payload = {
-            
-        }
-        response_Value = await self.requestsGet('userProbabilityPrizeList',  session)
-        try:
-            data=json.loads(response_Value).get("data")
-            if data is not None and len(data)>0:
-                for item in data:
-                    userProbabilityV = {
-                        "prizesname": item.get("prizeName"),
-                        "prizesId": item.get("id"),
-                        "lotteryConfigId": item.get("lotteryConfigId"),
-                        "sortOrder": item.get("sortOrder"),
-                        "imageUrl": item.get("imageUrl"),
-                    }
-                    self.userProbability.append(userProbabilityV)
-            return data
-        except  json.JSONDecodeError:
-            print("get_qycsUserRaffleCount json error",response_Value)
+        except Exception as e:
+            print(f"获取Ticket异常: {str(e)}")
             return None
 
-
-    async def get_qycsAllActivityTasks(self, session):
-        payload = {
-            
-        }
-        response_Value = await self.requestsGet('getAllActivityTasks', session)
+    # 获取userToken
+    def get_userToken(self, ticket):
+        url = f"https://backward.bol.wo.cn/prod-api/auth/marketUnicomLogin?ticket={ticket}"
+        headers = self.get_headers(Isheaders=2)
+        
         try:
-            active_id_listarr=json.loads(response_Value).get("data", [])
-            for item in active_id_listarr.get("activityTaskUserDetailVOList"):
+            resp = self.do_send(url, method="POST", headers=headers, show_resp=False)
+            userToken = resp.get("data", {}).get("token")
+            if userToken:
+                return userToken
+        
+        except Exception as e:
+            print(f"获取userToken异常: {str(e)}")
+            return None
+
+    # 获取所有活动任务
+    def get_AllActivityTasks(self, ecs_token, userToken):
+        url = "https://backward.bol.wo.cn/prod-api/promotion/activityTask/getAllActivityTasks?activityId=12"
+        headers = self.get_headers(Isheaders=2)
+        headers['Cookie'] = 'ecs_token=' + ecs_token
+        headers['Authorization'] = 'Bearer ' + userToken
+        shareList = []
+        
+        try:
+            resp = self.do_send(url, method="GET", headers=headers, show_resp=False)
+            active_id_listarr = resp.get("data", {})
+            for item in active_id_listarr.get("activityTaskUserDetailVOList", []):
                 share_info = {
                     "param": item.get("param1"),
                     "activityId": item.get("activityId"),
                     "name": item.get("name"),
+                    "triggerTime": item.get("triggerTime"),
+                    "triggeredTime": item.get("triggeredTime")
                 }
-                self.shareList.append(share_info)
+                shareList.append(share_info)
 
-        except  json.JSONDecodeError:
-            print("get_qycsAllActivityTasks json error",response_Value)
-            return None
+            return shareList
+
         except Exception as e:
-            print(f"error: {e}")
+            print(f"❌ 权益超市查询任务异常: {str(e)}")
             return None
 
-    async def requestsPost(self, url_name, payload, session):
+    # 执行任务
+    def do_ShareList(self, shareList, userToken):
         try:
-            url = self.urls.get(url_name)
-            if url_name=='marketUnicomLogin':
-                url+='?ticket='+self.ticket
-            if url_name=='checkShare' and self.share_param:
-                url+='?checkKey='+self.share_param
-            if url_name=='checkView' and self.share_param:
-                url+='?checkKey='+self.share_param
-            headers = getattr(self, 'headers', None)
-            if url_name in ('getUserRaffleCount','userRaffle','checkHelp','userProbability','userProbabilityPrizeList','xyprizeList','checkView'):
-                if self.userToken:
-                    headers['Authorization'] = 'Bearer '+self.userToken 
-            if url_name in ('grantPrize','getMyPrize','userProbability'):
-                headers['Accept'] = "application/json, text/plain, */*" 
-                headers['Accept-Encoding'] = "gzip, deflate, br, zstd"
-                headers['Content-Type'] =  "application/json"
-            response=await session.post(url, headers=headers, data=payload)
-            text = response.text
-            return text
+            for task in shareList:
+                share_name = task.get("name")
+                share_param = task.get("param")
+                target_count = int(task.get("triggerTime", 1))
+                current_count = int(task.get("triggeredTime", 0))
+                
+                if ("购买" in share_name or "秒杀" in share_name):
+                    print(f"🚫 {share_name} [PASS]")
+                    continue
+                    
+                if current_count >= target_count:
+                    print(f"✅ {share_name} 已完成")
+                    continue
+
+                url = ""
+                if share_param:
+                    if "浏览" in share_name or "查看" in share_name:
+                        url = f"https://backward.bol.wo.cn/prod-api/promotion/activityTaskShare/checkView?checkKey={share_param}"
+                    elif "分享" in share_name:
+                        url = f"https://backward.bol.wo.cn/prod-api/promotion/activityTaskShare/checkShare?checkKey={share_param}"
+
+                if url:
+                    headers = self.get_headers(Isheaders=2)
+                    headers['Authorization'] = 'Bearer ' + userToken
+                    resp = self.do_send(url, method="POST", headers=headers, show_resp=False)
+                    if resp and resp.get("code") == 200:
+                        print(f"✅ {share_name} 执行成功")
+
         except Exception as e:
-            return f"Error: {e}"
-    async def requestsGet(self, url_name,  session):
+            print(f"❌ 权益超市任务执行异常: {str(e)}")
+
+    # 查询抽奖池
+    def get_Raffle(self, userToken):
+        url = "https://backward.bol.wo.cn/prod-api/promotion/home/raffleActivity/prizeList?id=12"
+        headers = self.get_headers(Isheaders=2)
+        headers['Authorization'] = 'Bearer ' + userToken
+        
         try:
+            resp = self.do_send(url, method="POST", headers=headers, show_resp=False)
+            
+            keywords = ['月卡', '月会员', '月度', 'VIP月', '一个月']
+            live_prizes = []
+            
+            if 'data' in resp and isinstance(resp['data'], list):
+                for prize in resp['data']:
+                    name = prize.get('name', '')
+                    if not any(kw in name for kw in keywords):
+                        continue
+                    try:
+                        daily_limit = int(prize.get('dailyPrizeLimit', 0))
+                        quantity = int(prize.get('quantity', 0))
+                        prob = float(prize.get('probability', 0))
+                    except:
+                        daily_limit = 0
+                        quantity = 0
+                        prob = 0.0
 
-            url = self.urls.get(url_name)
-            headers = self.headers.copy() 
-            isredirect = False if url_name in "ticket" else True
-            if self.ecs_token:
-                headers['Cookie'] = 'ecs_token='+self.ecs_token 
-            if self.userToken:
-                headers['Authorization'] = 'Bearer '+self.userToken 
-            response=await session.get(url, headers=headers, follow_redirects=isredirect)
-            stauts=response.status_code 
-            if not isredirect and stauts in (301, 302, 303, 307, 308):
-                return response.headers.get('Location')
-            text = response.text
-            return text
+                    if daily_limit > 0 and quantity > 0:
+                        live_prizes.append({
+                            'name': name,
+                            'daily': daily_limit,
+                            'total': quantity,
+                            'prob': prob
+                        })
+            
+            if live_prizes:
+                print("📢 当前已放水！可抽有库存奖品👇👇👇")
+                for item in live_prizes:
+                    print(f"    {item['name']}")
+                    print(f"    └─ 今日投放: {item['daily']} | 总库存: {item['total']} | 概率: {item['prob'] * 100:.1f}%")
+                
+                return True
+            else:
+                print("📢 当前未放水！终止抽奖😡😡😡")
+                return False
+
         except Exception as e:
-            return f"Error: {e}"
+            print(f"❌ 权益超市抽奖查询异常: {str(e)}")
+            return False
 
-    async def process_task(self, session,delay):
-        await self.get_ecstoken(session)
-        ticket=await self.get_ticket(session)
-        await asyncio.sleep(delay)
-        token= await self.get_qycslogin(session)#登录
-        if token:
-            print(f"{self.currPhone}:登录成功")
+    # 查询抽奖次数
+    def get_raffle_count(self, userToken):
+        url = "https://backward.bol.wo.cn/prod-api/promotion/home/raffleActivity/getUserRaffleCount?id=12"
+        headers = self.get_headers(Isheaders=2)
+        headers['Authorization'] = 'Bearer ' + userToken
+        
+        try:
+            resp = self.do_send(url, method="POST", headers=headers, show_resp=False)
+            count = resp.get("data", 0)
+            print(f"✅ 当前抽奖次数：{count}")
+            
+            while count > 0:
+                print(f"🎯 第{abs(count - resp.get('data', 0)) + 1}次抽奖")
+                success = self.get_userRaffle(userToken)
+                if not success:
+                    break
+                count -= 1
+                print(f"剩余抽奖次数: {count}")
+
+        except Exception as e:
+            print(f"❌ 权益超市查询抽奖次数异常: {str(e)}")
+
+    # 执行抽奖
+    def get_userRaffle(self, userToken):
+        url = "https://backward.bol.wo.cn/prod-api/promotion/home/raffleActivity/userRaffle?id=12&channel="
+        headers = self.get_headers(Isheaders=2)
+        headers['Authorization'] = 'Bearer ' + userToken
+        
+        try:
+            resp = self.do_send(url, method="POST", headers=headers, show_resp=False)
+            if resp.get("code") == 200:
+                if resp.get("data"):
+                    lotteryRecordId = resp.get("data").get("lotteryRecordId")
+                    prizesName = resp.get("data").get("prizesName")
+                    message = resp.get("data").get("message")
+                    
+                    if prizesName:
+                        print(f"✅ 抽奖成功 {prizesName}")
+                    else:
+                        print(f"⚠️ 抽奖成功,但是{message}")
+                    
+                    if self.GrantPrize:
+                        print(f"✅ 已配置自动领奖")
+                        self.get_grantPrize(userToken, lotteryRecordId, prizesName)
+
+                    return True
+            
+            if resp.get("code") == 500:
+                return self.get_validateCaptcha(userToken)
+
+        except Exception as e:
+            print(f"❌ 权益超市抽奖异常: {str(e)}")
+            return False
+
+    # 人机验证
+    def get_validateCaptcha(self, userToken):
+        url = "https://backward.bol.wo.cn/prod-api/promotion/home/raffleActivity/validateCaptcha?id=12"
+        headers = self.get_headers(Isheaders=2)
+        headers['Authorization'] = 'Bearer ' + userToken
+        
+        try:
+            resp = self.do_send(url, method="POST", headers=headers, show_resp=False)
+            if resp.get("code") == 200:
+                return self.get_userRaffle(userToken)
+
+        except Exception as e:
+            print(f"❌ 权益超市人机验证异常: {str(e)}")
+            return False
+
+    # 查询我的奖品
+    def get_MyPrize(self, userToken):
+        url = "https://backward.bol.wo.cn/prod-api/promotion/home/raffleActivity/getMyPrize"
+        headers = self.get_headers(Isheaders=2)
+        headers['Authorization'] = 'Bearer ' + userToken
+        data = {
+            "id": 12,
+            "type": 0,
+            "page": 1,
+            "limit": 100
+        }
+        
+        try:
+            resp = self.do_send(url, method="POST", data=data, headers=headers, show_resp=False)
+            lists = resp.get("data", {}).get("list", [])
+            table = PrettyTable()
+            lottery_record_ids = []
+            
+            if lists:
+                table.title = f"未领取奖品信息"
+                table.field_names = ["商品名称", "商品ID", "获得时间", "失效时间"]
+                
+                for item in lists:
+                    lotteryRecordId = item.get("id")
+                    prizesName = item.get("prizesName")
+                    createTime = item.get("createTime")
+                    deadline = item.get("deadline")
+                    table.add_row([prizesName, lotteryRecordId, createTime, deadline])
+                    lottery_record_ids.append((lotteryRecordId, prizesName))
+                
+                print(table)
+
+                if self.GrantPrize:
+                    print(f"✅ 已配置自动领奖")
+                    for lottery_id, prizesName in lottery_record_ids:
+                        self.get_grantPrize(userToken, lottery_id, prizesName)
+
+        except Exception as e:
+            print(f"❌ 权益超市待领奖品查询异常: {str(e)}")
+
+    # 领取奖品
+    def get_grantPrize(self, userToken, lotteryRecordId, prizesName):
+        url = "https://backward.bol.wo.cn/prod-api/promotion/home/raffleActivity/grantPrize?activityId=12"
+        headers = self.get_headers(Isheaders=2)
+        headers['Accept'] = "application/json, text/plain, */*"
+        headers['Accept-Encoding'] = "gzip, deflate, br, zstd"
+        headers['Content-Type'] = "application/json"
+        headers['Authorization'] = 'Bearer ' + userToken
+        data = {"recordId": lotteryRecordId}
+        
+        try:
+            resp = self.do_send(url, method="POST", data=data, headers=headers, show_resp=False)
+            if resp.get("code") == 200:
+                print(f"✅ {prizesName} 领取成功")
+
+        except Exception as e:
+            print(f"❌ 权益超市领奖异常: {str(e)}")
+
+    # ============================================
+    # 权益超市主任务流程
+    def QYCS_task(self, phone: str, idx: int):
+        masked_phone = f"{phone[:3]}****{phone[-4:]}"
+        
+        # 获取账号信息
+        ecs_token = self.ecs_token_list[idx]
+        online_token = self.online_token_list[idx]
+        appid = self.appid_list[idx]
+        
+        print(f"📱 账号: {masked_phone}")
+        
+        # 根据登录凭证类型选择登录方式
+        if ecs_token:
+            # 方式1: 使用ecs_token
+            print(f"🔑 使用ecs_token登录方式")
+            final_ecs_token = ecs_token
+        elif online_token and appid:
+            # 方式2: 使用token_online和appid
+            print(f"🔑 使用token_online+appid登录方式")
+            final_ecs_token = self.login_with_token(phone, online_token, appid, masked_phone)
+            if not final_ecs_token:
+                print(f"❌ {masked_phone} 登录失败")
+                return
         else:
-            print(f"{self.currPhone}:登录失败")
+            print(f"❌ {masked_phone} 未提供有效登录凭证")
+            return
+        
+        print(f"✅ {masked_phone} 登录凭证获取成功，开始执行任务...")
+        
+        # 步骤1: 获取ticket
+        ticket = self.get_ticket(final_ecs_token)
+        if not ticket:
+            print(f"❌ {masked_phone} 获取ticket失败")
+            return
+        
+        print(f"✅ {masked_phone} 获取ticket成功")
+        
+        # 步骤2: 获取userToken
+        userToken = self.get_userToken(ticket)
+        if not userToken:
+            print(f"❌ {masked_phone} 获取用户令牌失败")
+            return
+        
+        print(f"✅ {masked_phone} 获取userToken成功")
+        
+        # 步骤3: 获取任务列表并执行
+        shareList = self.get_AllActivityTasks(final_ecs_token, userToken)
+        if shareList:
+            print(f"📋 {masked_phone} 获取到 {len(shareList)} 个任务")
+            self.do_ShareList(shareList, userToken)
+        else:
+            print(f"⚠️ {masked_phone} 未获取到任务列表")
+        
+        # 步骤4: 检查抽奖池并抽奖
+        print(f"🎲 {masked_phone} 检查抽奖池...")
+        if self.get_Raffle(userToken):
+            self.get_raffle_count(userToken)
+        
+        # 步骤5: 查询并领取奖品
+        print(f"🎁 {masked_phone} 查询待领奖品...")
+        self.get_MyPrize(userToken)
+        
+        print(f"✅ {masked_phone} 所有任务执行完成")
+
+    # 使用token_online登录
+    def login_with_token(self, phone: str, token_online: str, appid: str, masked_phone: str):
+        try:
+            url = "https://m.client.10010.com/mobileService/onLine.htm"
+            headers = self.get_headers(Isheaders=2)
+            data = {
+                "isFirstInstall": "1",
+                "reqtime": str(int(time.time() * 1000)),
+                "netWay": "Wifi",
+                "version": "android@11.0000",
+                "token_online": token_online,
+                "provinceChanel": "general",
+                "appId": appid,
+                "deviceModel": "23013RK75C",
+                "step": "welcom",
+                "androidId": "caaa7b5f2b58b3eb",
+                "deviceBrand": "Xiaomi",
+                "flushkey": "1"
+            }
+            resp = self.do_send(url, method="POST", data=data, headers=headers, show_resp=False)
+            ecs_token = resp.get("ecs_token")
+            if ecs_token:
+                print(f"✅ {masked_phone} token登录成功")
+                return ecs_token
+            else:
+                print(f"❌ {masked_phone} token登录失败: {resp}")
+                return None
+
+        except Exception as e:
+            print(f"❌ {masked_phone} token登录异常: {str(e)}")
             return None
-        await self.get_qycsAllActivityTasks(session)#查询任务
-        await asyncio.sleep(delay)
-        await self.get_qycscheckShareList(session)#分享通用确认
-        await asyncio.sleep(delay)
-        print(f"{self.currPhone}:开始查询可抽奖次数")
-        datanum= await self.get_qycsUserRaffleCount(session)#查抽奖次数
-        print(f"{self.currPhone}:抽奖次数"+str(datanum))
-        if datanum is not None and datanum > 0:
-            for i in range(datanum):
-                print(f"{self.currPhone}:开始抽奖第 {i + 1} 次")
-                await self.get_qycsuserRaffle(session)
-        else:
-            print(f"{self.currPhone}:没有抽奖次数或者发生某种异常!")
 
-        await asyncio.sleep(total_tasks)
-        await self.get_qycsgetMyPrize(session)#查询奖品领取情况
-        await asyncio.sleep(delay)
-        await self.get_qycsxy(session,delay)#许愿
+    # ============================================
+    # 主程序入口
+    def TASK(self):
+        if not self.phone_list:
+            print("❌ 未检测到有效账号")
+            return
+            
+        print(f"✅ 检测到 {len(self.phone_list)} 个账号")
+        
+        for idx, phone in enumerate(self.phone_list, 1):
+            print(f"\n{'='*60}")
+            print(f"========== 第 {idx} 个账号 ==========")
+            print(f"{'='*60}")
+            
+            self.QYCS_task(phone, idx - 1)
+            
+            # 账号间延迟
+            if idx < len(self.phone_list):
+                print(f"⏳ 等待 5 秒后执行下一个账号...")
+                time.sleep(5)
 
-        return None
+# ================================================
+# 程序入口
+if __name__ == "__main__":
+    # 读取环境变量
+    raw = os.getenv("UNICOM_ACCOUNTS", "").strip()
+    if not raw:
+        print("❌ 未检测到 UNICOM_ACCOUNTS 环境变量")
+        print("💡 请设置环境变量，支持以下格式：")
+        print("   格式1: 手机号1#ecs_token1")
+        print("   格式2: 手机号1#token_online1#appid1")
+        print("   多账号用换行分隔")
+        sys.exit(1)
 
-    async def main(self):
-        delay = 0.6
-        async with AsyncSessionManager(timeout=None, verify=False) as session:
-            task = asyncio.create_task(self.process_task(session,delay))
-            await task
+    # 解析账号列表
+    account_list = [line for line in raw.splitlines() if line.strip()]
+    if not account_list:
+        print("❌ 未检测到有效账号信息")
+        sys.exit(1)
 
-
-async def main(tokens):
-    processors = [TaskProcessor(token) for token in tokens]
-    tasks = [processor.main() for processor in processors]
-    await asyncio.gather(*tasks)
-
-if __name__ == '__main__':
-    if config.draw_before:
-        print("开启领取以前的权益")
-    else:
-        print("关闭领取以前的权益")
-
-
-
-    PHONES =os.environ.get('chinaUnicomCookie2') or '''token1@token2@token3'''
-   
-    ltTokens_list = re.split(config.split_pattern, PHONES)
-    total_tasks = len(ltTokens_list)
-    print("共有任务数："+str(total_tasks))
-    asyncio.run(main(ltTokens_list))
+    # 创建API实例并运行
+    api = ChinaunicomAPI(account_list)
+    api.TASK()
+    
+    print(f"\n{'='*60}")
+    print("✅ 所有账号任务执行完成！")
+    print(f"{'='*60}")
