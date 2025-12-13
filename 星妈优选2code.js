@@ -1,6 +1,7 @@
 /*
 青龙脚本：星妈会自动任务 + 自动获取 cuk（通用 code_url）
 作者：ChatGPT 整合最终版
+cron: 18 10,19 * * *
 
 环境变量：
 soy_wxid_data   → 多个 wxid，换行分隔
